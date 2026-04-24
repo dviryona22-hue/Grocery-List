@@ -124,7 +124,7 @@
 
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
-        import { getDatabase, ref, push, onValue, update, set } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js";
+        import { getDatabase, ref, push, onValue, update, set, remove, get } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js";
 
         const firebaseConfig = {
             apiKey: "AIzaSyBkgt6UqNO4x9mZcfnX5MuxXaG4Mjwi_4o",
@@ -140,8 +140,25 @@
         const db = getDatabase(app);
         const listRef = ref(db, 'groceries');
 
+        const FIVE_HOURS = 5 * 60 * 60 * 1000;
+
+        // ── Auto-delete checked items after 5 hours ───────────────────────────
+        async function deleteExpiredItems() {
+            const snapshot = await get(listRef);
+            const data = snapshot.val() || {};
+            const now = Date.now();
+            Object.keys(data).forEach(id => {
+                const item = data[id];
+                if (item.completed && item.completedAt && (now - item.completedAt) >= FIVE_HOURS) {
+                    remove(ref(db, 'groceries/' + id));
+                }
+            });
+        }
+
+        deleteExpiredItems();
+        setInterval(deleteExpiredItems, 60 * 1000);
+
         // ── Category definitions ──────────────────────────────────────────────
-        // Order matters: index 0 = rendered first (top of list)
         const CATEGORIES = [
             {
                 id: 'milky',
@@ -179,7 +196,7 @@
                 id: 'general',
                 label: '🛒 כללי',
                 order: 4,
-                keywords: []   // catch-all
+                keywords: []
             }
         ];
 
@@ -227,7 +244,6 @@
             input.value = '';
         };
 
-        // Allow pressing Enter to add
         document.getElementById('itemInput').addEventListener('keydown', e => {
             if (e.key === 'Enter') window.addItem();
         });
@@ -242,20 +258,17 @@
 
             let items = Object.keys(data).map(id => ({ id, ...data[id] }));
 
-            // Back-fill category for older items that were added before this update
             items.forEach(item => {
                 if (!item.category) item.category = getCategory(item.text);
             });
 
-            // Sort: by category order, then within category newest-first,
-            // completed items always go to the bottom.
             const catOrder = Object.fromEntries(CATEGORIES.map(c => [c.id, c.order]));
 
             items.sort((a, b) => {
                 if (a.completed !== b.completed) return a.completed - b.completed;
                 const co = (catOrder[a.category] ?? 99) - (catOrder[b.category] ?? 99);
                 if (co !== 0) return co;
-                return b.timestamp - a.timestamp; // newest first within category
+                return b.timestamp - a.timestamp;
             });
 
             items.forEach(item => {
@@ -269,22 +282,14 @@
 
                 const card = container.querySelector('.item-card');
 
-                // ── Hold-to-reveal + tap-to-check ─────────────────────────────
-                // We use touch events (not pointer events) because the browser fires
-                // pointercancel the moment it decides to scroll, which kills the timer.
-                // Touch events are NOT cancelled by scrolling, so the hold timer
-                // survives a scroll. We still keep track of movement so a scroll
-                // never accidentally triggers a tap/check.
                 let pressTimer = null;
                 let startX = 0, startY = 0;
                 let isHoldTriggered = false;
-                let moved = false; // true if finger moved enough to be a scroll
+                let moved = false;
 
                 card.addEventListener('contextmenu', e => e.preventDefault());
 
                 card.addEventListener('touchstart', e => {
-                    // If the page scrolled recently, ignore this touch for hold purposes.
-                    // The user is likely still flicking and we don't want an accidental hold.
                     if (scrolledRecently) return;
 
                     const t = e.touches[0];
@@ -294,7 +299,6 @@
                     moved = false;
 
                     pressTimer = setTimeout(() => {
-                        // Only flip if the finger hasn't scrolled away
                         if (!moved) {
                             isHoldTriggered = true;
                             card.classList.add('is-flipped');
@@ -308,7 +312,6 @@
                     const t = e.touches[0];
                     const dx = Math.abs(t.clientX - startX);
                     const dy = Math.abs(t.clientY - startY);
-                    // 8px threshold — any real scroll will exceed this easily
                     if (dx > 8 || dy > 8) {
                         moved = true;
                         clearTimeout(pressTimer);
@@ -317,15 +320,18 @@
 
                 card.addEventListener('touchend', e => {
                     clearTimeout(pressTimer);
-                    // Only toggle if: not a scroll, finger barely moved, hold didn't fire
                     if (!scrolledRecently && !moved && !isHoldTriggered) {
-                        update(ref(db, 'groceries/' + item.id), { completed: !item.completed });
+                        const newCompleted = !item.completed;
+                        // Set or clear completedAt based on new state
+                        const updates = { completed: newCompleted };
+                        updates.completedAt = newCompleted ? Date.now() : null;
+                        update(ref(db, 'groceries/' + item.id), updates);
                     }
                 }, { passive: true });
 
                 card.addEventListener('touchcancel', () => {
                     clearTimeout(pressTimer);
-                    moved = true; // treat cancel as a moved/scroll
+                    moved = true;
                 }, { passive: true });
 
                 listDiv.appendChild(container);
@@ -333,9 +339,6 @@
         });
 
         // ── Post-scroll cooldown ─────────────────────────────────────────────
-        // After scrolling stops, wait 350ms before allowing hold gestures.
-        // This fixes the bug where the browser stays in scroll mode and keeps
-        // cancelling touch events even after the finger is fully lifted.
         let scrolledRecently = false;
         let scrollCooldown = null;
         window.addEventListener('scroll', () => {
